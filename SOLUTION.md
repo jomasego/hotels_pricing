@@ -25,27 +25,31 @@ minimize Σ(calculated_price(i,j) - target_price(i,j))²
 2. 0.01 ≤ dᵢⱼ ≤ 0.99 (1% to 99% discount)
 3. dᵢⵢ < dᵢⱼ for j > i (monotonically increasing discounts)
 
-### 2. Optimization Methodology
+### 2. Optimization Methodology ⚙️
 
 #### Algorithm:
-- Primary: Sequential Least Squares Programming (SLSQP)
-- Fallback: Constrained Optimization BY Linear Approximation (COBYLA)
-- Implementation: Python's `scipy.optimize.minimize`
+- **Primary Optimizer**: Sequential Least Squares Programming (SLSQP).
+- **Fallback Optimizers**: 
+    1. Constrained Optimization BY Linear Approximation (COBYLA) - Used if SLSQP fails or the solution error metric is too high (e.g., > 500).
+    2. Nelder-Mead - Used as a final attempt if COBYLA also fails or its solution is unsatisfactory.
+- **Implementation**: Python's `scipy.optimize.minimize`.
 
 #### Key Features:
-1. **Robust Initialization**: 
-   - Base rates initialized around 100
-   - Discounts initialized in 5-15% range, increasing with cut-off
+1. **Robust Initialization** ✨:
+   - Base rates initialized based on matrix statistics (e.g., 75% of the mean of valid prices), with added noise for diversity.
+   - Discounts initialized to a small percentage (e.g., 5%) with slight random variations, ensuring initial monotonicity.
+   - Bounds: Base rates (min $1 or 25% of min price, max 150% of max price), Discounts (1% to 90%).
 
-2. **Constraint Handling**:
-   - Hard constraints on variable bounds
-   - Soft constraints for monotonic discounts with minimum 1% steps
-   - Penalty terms for constraint violations
+2. **Constraint Handling** ⚖️:
+   - Hard constraints for variable bounds (base rates and discounts).
+   - Inequality constraints to enforce strict monotonicity on discount tiers (e.g., `d_k+1 >= d_k + 0.001`).
+   - Penalty terms within the objective function for violations of soft constraints and to guide the solution towards desirable properties.
 
-3. **Error Handling**:
-   - Fallback to COBYLA if SLSQP fails
-   - Graceful degradation with meaningful error messages
-   - Input validation and data integrity checks
+3. **Error Handling & Fallback Logic** 🛡️:
+   - Multi-stage optimization: Tries SLSQP first. If it fails or the error metric (combined MAE and scaled MAPE) is above a threshold (e.g., 500), it falls back to COBYLA. If COBYLA also results in a high error or fails, it attempts Nelder-Mead.
+   - Solution evaluation helper function to assess quality.
+   - Graceful degradation with meaningful error messages and detailed logging.
+   - Input validation and data integrity checks during matrix loading.
 
 ### 3. Implementation Details
 
@@ -55,16 +59,23 @@ minimize Σ(calculated_price(i,j) - target_price(i,j))²
    - Load and validate input matrix
    - Run optimization with constraints
    - Post-process results to ensure validity
-3. **Output**:
-   - `vector.csv`: Base rates for each day
-   - `discounts.csv`: Discount percentages for each day and cut-off
-   - Console output with optimization metrics
+3. **Output** 📊:
+   - `vector.csv`: Calculated base rates for each day.
+   - `discounts.csv`: Calculated discount percentages for each day and cut-off tier.
+   - `price_comparison.csv`: Original prices vs. calculated prices for each valid stay.
+   - `original_prices.png`: Heatmap of the input pricing matrix.
+   - `base_rates.png`: Plot of the derived base rates over the 30 days.
+   - `discount_curves.png`: Plot of the derived discount tiers for each day.
+   - `calculated_prices.png`: Heatmap of the reconstructed price matrix using the derived base rates and discounts.
+   - `error_heatmap.png`: Heatmap of the absolute differences between original and calculated prices.
+   - Console output with optimization progress, final metrics, and status messages.
 
 #### Key Functions:
-- `calculate_prices()`: Compute prices from base rates and discounts
-- `objective_function()`: Calculate sum of squared errors
-- `solve()`: Main optimization routine
-- `_load_matrix()`: Data loading and validation
+- `_load_matrix()`: Data loading and validation from CSV.
+- `calculate_prices()`: Computes the price matrix from given base rates and discounts.
+- `objective_function()`: Calculates the weighted sum of squared errors plus penalties.
+- `solve()`: Main optimization routine orchestrating initialization, optimization attempts with fallbacks, post-processing, result saving, and plotting.
+- `plot_results()`: Generates and saves all visualizations.
 
 ### 4. Results and Validation
 
@@ -86,11 +97,15 @@ minimize Σ(calculated_price(i,j) - target_price(i,j))²
    30,0.052000,0.102000,0.152000,0.202000,0.252000,0.302000,0.352000,0.402000
    ```
 
-#### Performance Metrics:
-- Mean Absolute Percentage Error (MAPE): [value]%
-- Optimization Status: [Success/Failed]
-- Iterations: [number]
-- Function Evaluations: [number]
+#### Performance Metrics (Example from a successful SLSQP run):
+- Mean Absolute Error (MAE): $69.67
+- Mean Squared Error (MSE): 25973.70
+- Mean Absolute Percentage Error (MAPE): 7.24%
+- Median Absolute Percentage Error (MedAPE): 5.55%
+- Maximum Absolute Error: $1349.75
+- Optimization Status: Succeeded (SLSQP)
+- Iterations: 41
+- Function Evaluations: 11261
 
 ### 5. Usage
 
@@ -108,8 +123,8 @@ seaborn>=0.11.0
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the script
-python pricing_decomposition.py
+# Run the script (use `py` on Windows if `python` is not aliased correctly)
+py pricing_decomposition.py
 ```
 
 ### 6. Limitations and Future Work
