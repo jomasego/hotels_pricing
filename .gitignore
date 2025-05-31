@@ -31,24 +31,15 @@ ENV/
 *.swp
 *.swo
 
-# Data files
-*.csv
-*.xlsx
-*.db
-
-# Output files
-*.png
-*.jpg
-*.jpeg
-*.gif
-
-# Logs
-logs/
-*.log
+# Output files (keep input data files)
+!pricing_matrix_30x30.csv
+!vector.csv
+!discounts.csv
 
 # Local development
 .env
 .env.local
+*.local
 
 # OS generated files
 .DS_Store
