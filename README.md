@@ -1,93 +1,124 @@
 # Pricing Matrix Decomposition
 
-This project solves the pricing matrix decomposition problem where we need to determine:
-1. A vector of 30 nightly base rates
+This project solves the pricing matrix decomposition problem, aiming to determine a vector of 30 nightly base rates and corresponding discount tier structures that best reconstruct a given 30x30 matrix of stay prices.
 
 ## Problem Description
 Given a 30×30 upper-triangular matrix of stay prices where:
-- Rows 1-30 represent check-in days within a month (Day 1 to Day 30)
-- Columns 1-30 represent lengths of stay in nights (1 to 30)
-- Cell (i,j) holds the price for a stay beginning on Day i and lasting j nights
+- Rows 1-30 represent check-in days within a month (Day 1 to Day 30).
+- Columns 1-30 represent lengths of stay in nights (1 to 30).
+- Cell (i,j) holds the price for a stay beginning on Day i and lasting j nights.
 
-We need to find the base rates and discount tiers that minimize the discrepancy between the calculated prices and the target matrix.
+We need to find the base rates and discount tiers that minimize the discrepancy between the prices calculated from these components and the target input matrix.
 
 ## Solution Approach
 
-### 1. Objective Function
-We minimize the sum of squared differences between the calculated prices and the target prices. This is appropriate because:
-- It penalizes large errors more than small ones
-- It's differentiable, which helps with optimization
-- It's commonly used in regression problems
+### 1. Objective Functions
+The script now supports and runs two distinct objective functions to find the optimal base rates and discounts:
+- **Weighted Mean Squared Error (WMSE):** This objective minimizes the sum of squared differences between calculated and target prices, weighted by the inverse square root of the target price. This gives more importance to fitting lower-priced items accurately in absolute terms, while still penalizing large errors.
+- **Mean Squared Percentage Error (MSPE):** This objective minimizes the sum of squared *percentage* differences between calculated and target prices. This is useful for ensuring that the relative error is small across all price points.
+
+The script runs the optimization process for both objectives sequentially.
 
 ### 2. Decision Variables and Constraints
-- **Base rates (30 variables)**: One for each day, must be positive
-- **Discounts (30 × 8 variables)**: Discount percentages for each day and cut-off
+- **Base rates (30 variables)**: One for each day, constrained to be positive.
+- **Discounts (30 × 8 variables)**: Discount percentages for each day and for 8 predefined length-of-stay cutoffs (2, 3, 4, 5, 6, 7, 14, 28 days).
 - **Constraints**:
-  - Discounts must be between 0 and 1 (0% to 100%)
-  - For each day, discounts must be strictly increasing with cut-off length
+  - Discounts must be between 0.01 and 0.99 (1% to 99%).
+  - For each day, discounts must be non-decreasing with the length-of-stay cut-off.
 
 ### 3. Optimization Technique 🛠️
-We primarily use the **SLSQP (Sequential Least Squares Programming)** algorithm from SciPy's `minimize` function. 
-- It handles bounds and non-linear constraints effectively.
-- If SLSQP doesn't yield a satisfactory result (based on an error metric combining MAE and scaled MAPE) or fails, the system automatically falls back to **COBYLA (Constrained Optimization BY Linear Approximation)**, and then to **Nelder-Mead** as a final attempt to find a robust solution.
+For each objective function, the primary optimization algorithm used is **SLSQP (Sequential Least Squares Programming)** from SciPy's `minimize` function. 
+- It's well-suited for problems with bounds and non-linear constraints.
+- If SLSQP doesn't yield a satisfactory result (based on an objective-specific error metric) or fails, the system automatically falls back to **COBYLA (Constrained Optimization BY Linear Approximation)**, and then to **Nelder-Mead** as a final attempt to find a robust solution for that objective.
 
 ### 4. Computational Complexity
-- The problem has 30 + (30 × 8) = 270 variables
-- The objective function has O(n²) complexity where n is the number of days (30)
-- The optimization typically converges in 100-1000 iterations
-- Memory usage is moderate, primarily for storing the pricing matrix
+- The problem has 30 (base rates) + (30 × 8) (discounts) = 270 decision variables.
+- The objective function calculation involves iterating through the price matrix, roughly O(n²) where n is the number of days (30).
+- The optimization typically converges in several dozen to a few hundred iterations for each objective.
+- Memory usage is moderate, primarily for storing the pricing matrix and intermediate optimization arrays.
 
 ### 5. Validation and Error Reporting 📉
-- **Error Metrics**: The script calculates and reports Mean Absolute Error (MAE), Mean Squared Error (MSE), Mean Absolute Percentage Error (MAPE), Median Absolute Percentage Error (MedAPE), and Maximum Absolute Error.
-- **Visualizations**: 
-    - `original_prices.png`: Heatmap of the input matrix.
-    - `base_rates.png`: Plot of the derived base rates.
-    - `discount_curves.png`: Plot of the derived discount tiers.
-    - `calculated_prices.png`: Heatmap of the reconstructed price matrix.
-    - `error_heatmap.png`: Heatmap of absolute errors between original and calculated prices.
-- **CSV Outputs**: Detailed results are saved for further analysis.
+For each optimization objective run, the script calculates and reports:
+- Mean Absolute Error (MAE)
+- Mean Squared Error (MSE)
+- Mean Absolute Percentage Error (MAPE)
+- Median Absolute Percentage Error (MedAPE)
+- Root Mean Squared Percentage Error (RMSPE)
+- Maximum Absolute Error
 
 ## How to Run
 
-1. Install the required packages:
-   ```
-   pip install -r requirements.txt
-   ```
+1.  **Environment Setup**: It's recommended to use a virtual environment.
+    ```bash
+    python3 -m venv venv
+    source venv/bin/activate  # On Linux/macOS
+    # venv\Scripts\activate  # On Windows
+    ```
+2.  **Install Dependencies**:
+    ```bash
+    pip install -r requirements.txt
+    ```
+3.  **Input Data**: Place your `pricing_matrix_30x30.csv` file (or a similarly structured CSV) in the project directory. The script expects the first column to be an index (e.g., day numbers) and the header row to represent lengths of stay.
+4.  **Run the Script**:
+    ```bash
+    python3 pricing_decomposition.py
+    ```
+    (Use `py pricing_decomposition.py` on Windows if `python3` is not aliased or `python` points to an older version).
 
-2. Place your `pricing_matrix_30x30.csv` file in the project directory
-
-3. Run the script (use `py` on Windows if `python` is not aliased):
-   ```bash
-   py pricing_decomposition.py
-   ```
-
-4. The script will ✅:
-   - Load the `pricing_matrix_30x30.csv`.
-   - Run the optimization process, attempting multiple solvers if necessary.
-   - Save detailed results to CSV files:
-     - `vector.csv`: Derived base rates for each day.
-     - `discounts.csv`: Derived discount percentages for each day and length-of-stay tier.
-     - `price_comparison.csv`: Side-by-side comparison of original and calculated prices.
-   - Generate and save visualizations as PNG files (see list below).
+5.  **Outputs**: The script will:
+    *   Load the input pricing matrix.
+    *   Run the optimization process sequentially for both WMSE and MSPE objectives.
+    *   For each objective, save detailed results to CSV files, with suffixes like `_wmse` or `_mspe` (e.g., `vector_wmse.csv`, `discounts_mspe.csv`).
+    *   Generate and save visualizations as PNG files, also with corresponding suffixes (e.g., `base_rates_wmse.png`).
+    *   Generate a final `error_metrics_comparison.png` plot comparing key error metrics across all run objectives.
 
 ## Output Files 📂
 
-**CSV Files:**
-- `vector.csv`: Contains the 30 derived base rates, one for each day.
-- `discounts.csv`: A 30x8 matrix showing discount percentages. Rows correspond to check-in days, and columns correspond to predefined length-of-stay cutoffs (2, 3, 4, 5, 6, 7, 14, 28 days).
-- `price_comparison.csv`: Lists original prices, calculated/reconstructed prices, and the absolute error for all valid stay combinations.
+Output files are generated for each objective function and are distinguished by a suffix (e.g., `_wmse`, `_mspe`).
 
-**Image Files (Visualizations - PNG):**
-- `original_prices.png`: A heatmap visualization of the input pricing matrix.
-- `base_rates.png`: A line plot showing the trend of the derived base rates over the 30 days.
-- `discount_curves.png`: Line plots illustrating the discount structures (percentage vs. length of stay) for each of the 30 days.
-- `calculated_prices.png`: A heatmap of the price matrix reconstructed using the optimized base rates and discounts.
-- `error_heatmap.png`: A heatmap showing the absolute differences between the original and the reconstructed prices, highlighting areas of larger discrepancies.
+**CSV Files (per objective):**
+- `vector{suffix}.csv`: Contains the 30 derived base rates.
+- `discounts{suffix}.csv`: A 30x8 matrix showing discount percentages for each day and LOS tier.
+- `price_comparison{suffix}.csv`: Lists original prices, calculated prices, and absolute errors.
+
+**Image Files (Visualizations - PNG, per objective):**
+- `original_prices.png`: Heatmap of the input pricing matrix (generated once).
+- `base_rates{suffix}.png`: Line plot of derived base rates.
+- `discount_curves{suffix}.png`: Line plots of discount structures.
+- `calculated_prices{suffix}.png`: Heatmap of the reconstructed price matrix.
+- `error_heatmap{suffix}.png`: Heatmap of absolute errors.
+
+**Comparison Image File (PNG):**
+- `error_metrics_comparison.png`: A bar chart comparing key error metrics (MAE, MAPE, RMSPE) between the WMSE and MSPE optimization runs.
 
 ## Dependencies
-- Python 3.7+
+- Python 3.8+
 - numpy
 - pandas
 - scipy
 - matplotlib
 - seaborn
+- pulp (listed in requirements, though direct usage might vary)
+
+## Example Results (with `pricing_matrix_30x30.csv`)
+
+The following table summarizes the typical error metrics achieved when running the script with the provided `pricing_matrix_30x30.csv` example data for both the Weighted MSE (WMSE) and Mean Squared Percentage Error (MSPE) objectives:
+
+| Metric                       | Weighted MSE (WMSE) | Mean Squared Percentage Error (MSPE) |
+| :--------------------------- | :------------------: | :------------------------------------: |
+| MAE (Mean Absolute Error)    |        $41.09       |                 $33.04                 |
+| MSE (Mean Squared Error)     |       5766.31       |                9098.36                 |
+| MAPE (Mean Abs. % Error)   |        6.17%         |                 3.29%                  |
+| MedAPE (Median Abs. % Error) |        5.15%         |                 2.44%                  |
+| RMSPE (Root Mean Sq. % Err.) |        8.41%         |                 5.58%                  |
+| Max Absolute Error           |       $593.58       |                $852.36                 |
+
+*Note: These values are based on a specific run and may vary slightly due to the stochastic nature of some optimization aspects or minor code changes.*
+
+**Visual Comparison of Error Metrics:**
+
+The `error_metrics_comparison.png` plot provides a visual summary of key performance indicators:
+
+![Error Metrics Comparison](error_metrics_comparison.png)
+
+This comparison helps in choosing the objective function that best aligns with specific business priorities (e.g., minimizing absolute vs. percentage errors).

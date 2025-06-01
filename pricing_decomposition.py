@@ -17,6 +17,8 @@ class PricingMatrixDecomposer:
         self.n_days = self.matrix.shape[0]
         self.cutoffs = np.array([2, 3, 4, 5, 6, 7, 14, 28])
         self.n_cutoffs = len(self.cutoffs)
+        self.active_objective_type = None # To be set by solve method
+        self.objective_filename_suffix = "" # To be set by solve method
         
     def _load_matrix(self, file_path):
         """
@@ -78,69 +80,98 @@ class PricingMatrixDecomposer:
     def objective_function(self, x):
         """
         Compute the objective function value for the current solution vector.
+        Conditionally calculates error based on self.active_objective_type.
         """
         try:
-            # Split the solution vector into base rates and discounts
             base_rates = x[:self.n_days]
             discounts = x[self.n_days:].reshape((self.n_days, self.n_cutoffs))
-            
-            # Ensure base rates are positive
+
             if np.any(base_rates <= 0):
-                return 1e15  # Heavy penalty for invalid base rates
-            
-            # Clip discounts to valid range [0.01, 0.99] to prevent division by zero or negative discounts
+                return 1e15
             discounts = np.clip(discounts, 0.01, 0.99)
-            
-            # Calculate the prices based on the current parameters
             calculated_matrix = self.calculate_prices(base_rates, discounts)
-            
-            # Compute the squared error between the calculated and target matrices
-            # Only for cells that have valid values in the target matrix
-            error = calculated_matrix - self.matrix
+            error_values = calculated_matrix - self.matrix
             valid_mask = ~np.isnan(self.matrix)
-            
+
             if np.sum(valid_mask) == 0:
-                return 1e15  # Return a large number if there are no valid entries
-                
-            # Check if calculated matrix contains NaN values where it shouldn't
+                return 1e15
             if np.any(np.isnan(calculated_matrix[valid_mask])):
-                return 1e15  # Heavy penalty for NaN values
+                return 1e15
+
+            core_error = 0
+            # Penalty coefficients will be set based on objective type
+            penalty_non_monotonic_coeff = 0.0
+            regularization_coeff = 0.0
+            boundary_penalty_coeff = 0.0
+
+            if self.active_objective_type == 'MSPE':
+                original_prices_for_pe = np.maximum(self.matrix[valid_mask], 1.0)
+                percentage_error = error_values[valid_mask] / original_prices_for_pe
+                core_error = np.mean(percentage_error ** 2) # MSPE
+                
+                penalty_non_monotonic_coeff = 100.0
+                regularization_coeff = 1e-8
+                boundary_penalty_coeff = 1.0 
+
+            elif self.active_objective_type == 'WMSE':
+                weights = 1.0 / (np.maximum(self.matrix[valid_mask], 1.0) ** 0.5)
+                core_error = np.sum(weights * (error_values[valid_mask]) ** 2) / np.sum(valid_mask) # Weighted MSE
+
+                penalty_non_monotonic_coeff = 1e6
+                regularization_coeff = 1e-4 
+                boundary_penalty_coeff = 1e4
+            else:
+                raise ValueError(f"Unknown objective type: {self.active_objective_type}")
+
+            # Shared penalty calculations
+            monotonicity_penalty_val = 0.0
+            for d_idx in range(self.n_days):
+                for c_idx in range(1, self.n_cutoffs):
+                    if discounts[d_idx, c_idx] < discounts[d_idx, c_idx - 1]:
+                        monotonicity_penalty_val += (discounts[d_idx, c_idx - 1] - discounts[d_idx, c_idx]) ** 2
             
-            # Use weighted squared error to emphasize lower prices more
-            weights = 1.0 / (np.maximum(self.matrix[valid_mask], 1.0) ** 0.5)  # Use sqrt weighting for better scaling
-            weighted_sq_error = np.sum(weights * (error[valid_mask]) ** 2) / np.sum(valid_mask)
+            regularization_penalty_val = np.sum(base_rates ** 2)
             
-            # Add penalty for non-monotonic discounts within each day
-            penalty = 0.0
-            for d in range(self.n_days):
-                for i in range(1, self.n_cutoffs):
-                    if discounts[d, i] < discounts[d, i-1]:
-                        penalty += 1e6 * (discounts[d, i-1] - discounts[d, i]) ** 2
+            # Using the more nuanced boundary penalty for both, scaled by coefficient
+            # Calculate penalties separately to avoid broadcasting issues with empty arrays
+            lower_bound_mask = (discounts < 0.05)
+            upper_bound_mask = (discounts > 0.95)
             
-            # Add L2 regularization to prevent extreme values
-            regularization = 1e-4 * np.sum(base_rates ** 2) / self.n_days
+            extreme_discount_penalty_val = 0.0
+            if np.any(lower_bound_mask):
+                extreme_discount_penalty_val += np.sum(lower_bound_mask * (0.05 - discounts)**2)
+            if np.any(upper_bound_mask):
+                extreme_discount_penalty_val += np.sum(upper_bound_mask * (discounts - 0.95)**2)
+
+            # Apply coefficients
+            total_penalty = (
+                monotonicity_penalty_val * penalty_non_monotonic_coeff +
+                regularization_penalty_val * regularization_coeff +
+                extreme_discount_penalty_val * boundary_penalty_coeff
+            )
             
-            # Penalize extreme discounts that are close to boundaries
-            boundary_penalty = 1e4 * np.sum((discounts < 0.05) | (discounts > 0.95))
-            
-            # Return the weighted squared error plus any penalties
-            result = weighted_sq_error + penalty + regularization + boundary_penalty
-            
-            # Check for numerical issues
+            result = core_error + total_penalty
+
             if np.isnan(result) or np.isinf(result):
                 return 1e15
-                
             return result
-            
+
         except Exception as e:
-            print(f"Error in objective function: {str(e)}")
-            return 1e15  # Return a large number if there was an error
+            print(f"Error in objective function ({self.active_objective_type}): {str(e)}")
+            return 1e15
     
-    def solve(self, method='SLSQP', max_iter=1000):
+    def solve(self, objective_config, method='SLSQP', max_iter=1000):
         """
         Solve the optimization problem to find the best base rates and discounts.
+        Uses objective_config to determine error metric and output naming.
+        objective_config = {'type': 'MSPE'/'WMSE', 'suffix': '_suffix', 'display_name': 'Display Name'}
         """
-        print(f"\nStarting optimization with method: {method} (max {max_iter} iterations)...")
+        self.active_objective_type = objective_config['type']
+        self.objective_filename_suffix = objective_config['suffix']
+        objective_display_name = objective_config['display_name']
+
+        print(f"\n--- Starting Optimization for: {objective_display_name} ({self.active_objective_type}) ---")
+        print(f"Primary method: {method} (max {max_iter} iterations)...")
 
         valid_prices = self.matrix[~np.isnan(self.matrix)]
         if len(valid_prices) == 0:
@@ -206,11 +237,21 @@ class PricingMatrixDecomposer:
                 calc = self.calculate_prices(br, disc)
                 errs = calc - self.matrix
                 valid_m = ~np.isnan(self.matrix)
-                abs_errs = np.abs(errs[valid_m])
-                rel_errs = abs_errs / np.maximum(self.matrix[valid_m], 1.0)
-                current_mae = np.mean(abs_errs)
-                current_mape = np.mean(rel_errs) * 100
-                return current_mae + current_mape / 10
+                if self.active_objective_type == 'MSPE':
+                    # Calculate RMSPE for evaluation
+                    original_prices_for_pe = np.maximum(self.matrix[valid_m], 1.0)
+                    percentage_errors = errs[valid_m] / original_prices_for_pe
+                    mspe_eval = np.mean(percentage_errors ** 2)
+                    rmspe_eval = np.sqrt(mspe_eval) * 100  # As a percentage
+                    return rmspe_eval
+                elif self.active_objective_type == 'WMSE':
+                    abs_errs = np.abs(errs[valid_m])
+                    rel_errs = abs_errs / np.maximum(self.matrix[valid_m], 1.0)
+                    current_mae = np.mean(abs_errs)
+                    current_mape = np.mean(rel_errs) * 100
+                    return current_mae + current_mape / 10 # Original WMSE evaluation metric
+                else:
+                    return float('inf')
             except Exception as eval_e:
                 print(f"Error evaluating solution: {eval_e}")
                 return float('inf')
@@ -229,10 +270,19 @@ class PricingMatrixDecomposer:
             current_options = opt_config['options']
             # Skip primary if it's already tried or if error is too high for subsequent ones
             if best_result_obj is not None and current_method == method: # Already tried primary
-                 if not best_result_obj.success or best_error_val > 1000 and current_method == 'COBYLA':
-                    pass # Allow COBYLA if primary failed badly
-                 elif best_error_val > 500 and current_method == 'Nelder-Mead':
-                    pass # Allow Nelder-Mead if others were not good enough
+                 # Conditional fallback thresholds
+                 if self.active_objective_type == 'MSPE':
+                     # Thresholds for RMSPE (e.g., 75 means 75% RMSPE)
+                     if not best_result_obj.success or best_error_val > 75 and current_method == 'COBYLA': 
+                         pass 
+                     elif best_error_val > 50 and current_method == 'Nelder-Mead': 
+                         pass
+                 elif self.active_objective_type == 'WMSE':
+                     # Thresholds for MAE + MAPE/10 (e.g., 500)
+                     if not best_result_obj.success or best_error_val > 500 and current_method == 'COBYLA':
+                         pass
+                     elif best_error_val > 250 and current_method == 'Nelder-Mead':
+                         pass
                  elif current_method != method: # Only proceed if it's a fallback
                     continue
             
@@ -289,40 +339,58 @@ class PricingMatrixDecomposer:
         if len(final_abs_errors) == 0: # Handle case with no valid prices for error calculation
             mae, mse, mape, median_ape, max_err = float('nan'), float('nan'), float('nan'), float('nan'), float('nan')
         else:
-            mse = np.mean(np.square(final_abs_errors))
-            mae = np.mean(final_abs_errors)
+            final_mse = np.mean(np.square(final_abs_errors))
+            final_mae = np.mean(final_abs_errors)
             final_rel_errors = final_abs_errors / np.maximum(1.0, self.matrix[final_valid_mask])
-            mape = 100 * np.mean(final_rel_errors)
-            median_ape = 100 * np.median(final_rel_errors)
-            max_err = np.max(final_abs_errors)
+            final_mape = 100 * np.mean(final_rel_errors)
+            final_median_ape = np.median(final_abs_errors / np.maximum(self.matrix[final_valid_mask], 1.0)) * 100
+            final_max_error = np.max(final_abs_errors)
+            final_percentage_errors_for_rmspe = final_abs_errors / np.maximum(self.matrix[final_valid_mask], 1.0)
+            final_mspe = np.mean(final_percentage_errors_for_rmspe ** 2)
+            final_rmspe = np.sqrt(final_mspe) * 100
 
-        print(f"\nFinal Error Metrics:")
-        print(f"  Mean Absolute Error: ${mae:.2f}")
-        print(f"  Mean Squared Error: {mse:.2f}")
-        print(f"  Mean Absolute Percentage Error: {mape:.2f}%")
-        print(f"  Median Absolute Percentage Error: {median_ape:.2f}%")
-        print(f"  Max Absolute Error: ${max_err:.2f}")
-
-        try:
-            print("\nSaving results to CSV files...")
-            pd.DataFrame({'Day': range(1, self.n_days + 1), 'Base_Rate': final_base_rates}).to_csv('vector.csv', index=False)
-            print(f"Base rates saved to vector.csv")
-
-            discount_df_final = pd.DataFrame(final_discounts)
-            discount_df_final.index.name = 'Day'
-            discount_df_final.columns = [f'Tier_{j+1}' for j in range(self.n_cutoffs)]
-            discount_df_final.to_csv('discounts.csv')
-            print(f"Discount tiers saved to discounts.csv")
-
-            pd.DataFrame({'Original': self.matrix.flatten(), 'Calculated': final_calculated_prices.flatten()}).to_csv('price_comparison.csv', index=False)
-            print(f"Price comparison saved to price_comparison.csv")
-        except Exception as csv_e:
-            print(f"Error saving results to CSV: {csv_e}")
+        print("\nFinal Error Metrics:")
+        print(f"  Mean Absolute Error: ${final_mae:.2f}")
+        print(f"  Mean Squared Error: {final_mse:.2f}")
+        print(f"  Mean Absolute Percentage Error: {final_mape:.2f}%")
+        print(f"  Median Absolute Percentage Error: {final_median_ape:.2f}%")
+        print(f"  Root Mean Squared Percentage Error: {final_rmspe:.2f}%")
+        print(f"  Max Absolute Error: ${final_max_error:.2f}")
 
         try:
-            self.plot_results(final_base_rates, final_discounts, final_calculated_prices)
-        except Exception as plot_e:
-            print(f"Error generating visualizations: {plot_e}")
+            print(f"\nSaving results for {objective_display_name} to CSV files...")
+            pd.DataFrame(final_base_rates, columns=['Base_Rate'], index=[f'Day {i+1}' for i in range(self.n_days)]).to_csv(f'vector{self.objective_filename_suffix}.csv')
+            pd.DataFrame(final_discounts, columns=[f'Cutoff_{c}' for c in self.cutoffs], index=[f'Day {i+1}' for i in range(self.n_days)]).to_csv(f'discounts{self.objective_filename_suffix}.csv')
+            
+            comparison_data = []
+            for r_idx in range(self.n_days):
+                for c_idx in range(self.n_days):
+                    if not np.isnan(self.matrix[r_idx, c_idx]):
+                        comparison_data.append({
+                            'Day': r_idx + 1,
+                            'LOS': c_idx + 1,
+                            'OriginalPrice': self.matrix[r_idx, c_idx],
+                            'CalculatedPrice': final_calculated_prices[r_idx, c_idx],
+                            'AbsoluteError': abs(final_errors[r_idx, c_idx])
+                        })
+            pd.DataFrame(comparison_data).to_csv(f'price_comparison{self.objective_filename_suffix}.csv', index=False)
+            print(f"Base rates saved to vector{self.objective_filename_suffix}.csv")
+            print(f"Discount tiers saved to discounts{self.objective_filename_suffix}.csv")
+            print(f"Price comparison saved to price_comparison{self.objective_filename_suffix}.csv")
+
+            self.plot_results(final_base_rates, final_discounts, final_calculated_prices, filename_suffix=self.objective_filename_suffix)
+
+        except Exception as save_e:
+            print(f"Error saving results or plotting for {objective_display_name}: {save_e}")
+
+        error_metrics = {
+            'mae': final_mae,
+            'mse': final_mse,
+            'mape': final_mape,
+            'median_ape': final_median_ape,
+            'max_error': final_max_error,
+            'rmspe': final_rmspe
+        }
 
         return {
             'success': best_result_obj.success,
@@ -330,116 +398,207 @@ class PricingMatrixDecomposer:
             'base_rates': final_base_rates,
             'discounts': final_discounts,
             'calculated': final_calculated_prices,
-            'error_metrics': {
-                'mae': mae, 'mse': mse, 'mape': mape,
-                'median_ape': median_ape, 'max_error': max_err
-            }
+            'error_metrics': error_metrics
         }
 
-    def plot_results(self, base_rates, discounts, calculated):
-        """Plot the results of the optimization."""
-        # Plot base rates
-        plt.figure(figsize=(12, 6))
-        plt.plot(base_rates)
-        plt.xlabel('Day')
-        plt.ylabel('Base Rate')
-        plt.title('Base Rates')
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig('base_rates.png', dpi=300, bbox_inches='tight')
-        plt.close()
+    def plot_results(self, base_rates, discounts, calculated, filename_suffix=""):
+        """
+        Plot the results of the optimization. Appends suffix to filenames.
+        """
+        print(f"\nGenerating visualizations with suffix: '{filename_suffix}'...")
+        try:
+            # Original Prices Heatmap (only needs to be saved once, without suffix, or with a generic one if preferred)
+            # For simplicity, let's assume it's okay to overwrite or save it once.
+            # If it's the first run (e.g., suffix is for MSPE), save it.
+            if "_mspe" in filename_suffix or not filename_suffix: # Heuristic to save once
+                plt.figure(figsize=(12, 10))
+                sns.heatmap(self.matrix, annot=False, fmt=".0f", cmap="viridis", cbar_kws={'label': 'Original Price ($)'})
+                plt.title("Original Pricing Matrix")
+                plt.xlabel("Length of Stay (Days)")
+                plt.ylabel("Start Day")
+                plt.savefig(f'original_prices.png') # No suffix for the original, or a generic one
+                plt.close()
 
-        # Plot discounts
-        plt.figure(figsize=(12, 6))
-        for d in range(self.n_days):
-            plt.plot(discounts[d], label=f'Day {d+1}')
-        plt.xlabel('Length of Stay')
-        plt.ylabel('Discount Factor')
-        plt.title('Discount Curves')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig('discount_curves.png', dpi=300, bbox_inches='tight')
-        plt.close()
+            # Base Rates Line Plot
+            plt.figure(figsize=(12, 6))
+            plt.plot(range(1, self.n_days + 1), base_rates, marker='o', linestyle='-')
+            plt.title(f"Optimized Base Rates Per Day ({self.active_objective_type})")
+            plt.xlabel("Day")
+            plt.ylabel("Base Rate ($)")
+            plt.grid(True)
+            plt.savefig(f'base_rates{filename_suffix}.png')
+            plt.close()
 
-        # Plot calculated prices
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(calculated, cmap='viridis', mask=np.isnan(self.matrix))
-        plt.title('Calculated Price Matrix')
-        plt.tight_layout()
-        plt.savefig('calculated_prices.png', dpi=300, bbox_inches='tight')
-        plt.close()
+            # Discount Curves Line Plot
+            plt.figure(figsize=(14, 8))
+            for i in range(self.n_cutoffs):
+                plt.plot(range(1, self.n_days + 1), discounts[:, i] * 100, marker='.', label=f'LOS Cutoff: {self.cutoffs[i]} days')
+            plt.title(f"Optimized Discount Tiers Per Day ({self.active_objective_type})")
+            plt.xlabel("Start Day")
+            plt.ylabel("Discount (%)")
+            plt.legend(title="Discount Tiers", bbox_to_anchor=(1.05, 1), loc='upper left')
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f'discount_curves{filename_suffix}.png')
+            plt.close()
 
-        # Plot error heatmap
-        error = np.abs(calculated - self.matrix)
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(error, cmap='Reds', mask=np.isnan(self.matrix), vmin=0, vmax=np.nanmax(error)/2)
-        plt.title('Absolute Error Heatmap')
-        plt.tight_layout()
-        plt.savefig('error_heatmap.png', dpi=300, bbox_inches='tight')
-        plt.close()
+            # Calculated Prices Heatmap
+            plt.figure(figsize=(12, 10))
+            sns.heatmap(calculated, annot=False, fmt=".0f", cmap="viridis", cbar_kws={'label': 'Calculated Price ($)'})
+            plt.title(f"Calculated Pricing Matrix ({self.active_objective_type})")
+            plt.xlabel("Length of Stay (Days)")
+            plt.ylabel("Start Day")
+            plt.savefig(f'calculated_prices{filename_suffix}.png')
+            plt.close()
+
+            # Error Heatmap (Absolute Error)
+            error_matrix = calculated - self.matrix
+            plt.figure(figsize=(12, 10))
+            sns.heatmap(error_matrix, annot=False, fmt=".0f", cmap="coolwarm", center=0, cbar_kws={'label': 'Absolute Error ($)'})
+            plt.title(f"Absolute Error Matrix ({self.active_objective_type})")
+            plt.xlabel("Length of Stay (Days)")
+            plt.ylabel("Start Day")
+            plt.savefig(f'error_heatmap{filename_suffix}.png')
+            plt.close()
+            print(f"Visualizations saved as PNG files (suffix: '{filename_suffix}').")
+
+        except Exception as e:
+            print(f"An error occurred during plotting ({self.active_objective_type}): {e}")
+
+
+
+def plot_comparison_results(metrics_list, objective_names):
+    """
+    Plots a comparison of error metrics for different optimization objectives.
+
+    Args:
+        metrics_list (list): A list of dictionaries, where each dictionary contains
+                             error metrics for one objective.
+                             Example: [{'mae': 10, 'mape': 5, ...}, {'mae': 12, 'mape': 6, ...}]
+        objective_names (list): A list of names for the objectives, corresponding
+                                to the order in metrics_list.
+                                Example: ['WMSE', 'MSPE']
+    """
+    metrics_to_plot = ['mae', 'mape', 'rmspe', 'median_ape', 'max_error']
+    metric_labels = {
+        'mae': 'Mean Absolute Error ($)',
+        'mape': 'Mean Absolute Percentage Error (%)',
+        'rmspe': 'Root Mean Squared Percentage Error (%)',
+        'median_ape': 'Median Absolute Percentage Error (%)',
+        'max_error': 'Max Absolute Error ($)'
+    }
+
+    n_objectives = len(metrics_list)
+    n_metrics = len(metrics_to_plot)
+
+    # Prepare data for plotting
+    plot_data = {}
+    for metric_key in metrics_to_plot:
+        plot_data[metric_key] = [metrics_dict.get(metric_key, float('nan')) for metrics_dict in metrics_list]
+
+    x = np.arange(n_metrics)  # the label locations for metrics
+    total_width = 0.8  # Total width for all bars for a given metric
+    bar_width = total_width / n_objectives # the width of individual bars
+    
+    fig, ax = plt.subplots(figsize=(15, 8)) # Increased figure size for better readability
+
+    for i in range(n_objectives):
+        # Calculate offset for each bar group
+        offset = (i - (n_objectives - 1) / 2.0) * bar_width
+        current_metric_values = [plot_data[metric_key][i] for metric_key in metrics_to_plot]
+        rects = ax.bar(x + offset, current_metric_values, bar_width, label=objective_names[i])
+        ax.bar_label(rects, padding=3, fmt='%.2f', fontsize=8) # Adjusted font size
+
+    ax.set_ylabel('Error Value', fontsize=12)
+    ax.set_title('Comparison of Optimization Objective Error Metrics', fontsize=14)
+    ax.set_xticks(x)
+    ax.set_xticklabels([metric_labels[m] for m in metrics_to_plot], fontsize=10)
+    ax.legend(fontsize=10)
+    
+    plt.xticks(rotation=20, ha="right") # Adjusted rotation
+    fig.tight_layout() # Apply tight layout
+    
+    try:
+        plt.savefig('error_metrics_comparison.png')
+        print("\nSaved error metrics comparison plot to error_metrics_comparison.png")
+    except Exception as e:
+        print(f"Error saving comparison plot: {e}")
+    finally:
+        plt.close(fig)
 
 def main():
-    # Load the pricing matrix
     print("Loading pricing matrix from pricing_matrix_30x30.csv...")
     try:
         decomposer = PricingMatrixDecomposer("pricing_matrix_30x30.csv")
         print(f"Matrix shape: {decomposer.matrix.shape}")
         print(f"Number of valid entries: {np.sum(~np.isnan(decomposer.matrix))}")
-        
-        # Plot the original price matrix
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(decomposer.matrix, cmap='viridis', 
-                    mask=np.isnan(decomposer.matrix))
-        plt.title('Original Price Matrix')
-        plt.tight_layout()
-        plt.savefig('original_prices.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        
     except Exception as e:
         print(f"Error loading matrix: {str(e)}")
         import traceback
         traceback.print_exc()
         return
-    
-    # Solve the optimization problem
-    print("\nStarting optimization (this may take a few minutes)...")
-    try:
-        result = decomposer.solve(method='SLSQP', max_iter=1000) # solve now handles plotting
-        
-        # Print detailed results
-        print("\n" + "="*50)
-        print("OPTIMIZATION RESULTS")
-        print("="*50)
-        
-        print(f"\nOptimization {'succeeded' if result['success'] else 'failed'}")
-        if 'message' in result and result['message'] and result['message'] != 'N/A':
-            print(f"Message: {result['message']}")
-        
-        print("\nPerformance Metrics from optimization:")
-        error_metrics = result.get('error_metrics', {})
-        print(f"- Mean Absolute Error (MAE): {error_metrics.get('mae', float('nan')):.2f}")
-        print(f"- Mean Squared Error (MSE): {error_metrics.get('mse', float('nan')):.2f}")
-        print(f"- Mean Absolute Percentage Error (MAPE): {error_metrics.get('mape', float('nan')):.2f}%")
-        print(f"- Median Absolute Percentage Error (MedAPE): {error_metrics.get('median_ape', float('nan')):.2f}%")
-        print(f"- Maximum Absolute Error: {error_metrics.get('max_error', float('nan')):.2f}")
+
+    objective_configs = [
+        {
+            'type': 'WMSE',
+            'suffix': '_wmse',
+            'display_name': 'Weighted MSE'
+        },
+        {
+            'type': 'MSPE',
+            'suffix': '_mspe',
+            'display_name': 'Mean Squared Percentage Error'
+        }
+    ]
+
+    all_metrics = []
+    objective_names_for_plot = []
+
+    for config in objective_configs:
+        print(f"\nStarting optimization for {config['display_name']} (this may take a few minutes)...")
+        try:
+            result = decomposer.solve(objective_config=config, method='SLSQP', max_iter=1000)
             
-    except Exception as e:
-        print(f"\nError during optimization: {str(e)}")
-        import traceback
-        traceback.print_exc()
-    
+            print("\n" + "="*50)
+            print(f"OPTIMIZATION RESULTS for {config['display_name']}")
+            print("="*50)
+            
+            print(f"\nOptimization {'succeeded' if result['success'] else 'failed'}")
+            if 'message' in result and result['message'] and result['message'] != 'N/A':
+                print(f"Message: {result['message']}")
+            
+            error_metrics = result.get('error_metrics', {})
+            print("\nPerformance Metrics:")
+            print(f"- Mean Absolute Error (MAE): {error_metrics.get('mae', float('nan')):.2f}")
+            print(f"- Mean Squared Error (MSE): {error_metrics.get('mse', float('nan')):.2f}") # Note: This is raw MSE for WMSE, not weighted.
+            print(f"- Mean Absolute Percentage Error (MAPE): {error_metrics.get('mape', float('nan')):.2f}%")
+            print(f"- Median Absolute Percentage Error (MedAPE): {error_metrics.get('median_ape', float('nan')):.2f}%")
+            print(f"- Root Mean Squared Percentage Error (RMSPE): {error_metrics.get('rmspe', float('nan')):.2f}%")
+            print(f"- Maximum Absolute Error: {error_metrics.get('max_error', float('nan')):.2f}")
+            
+            all_metrics.append(error_metrics)
+            objective_names_for_plot.append(config['display_name'])
+            
+            print(f"\nResults for {config['display_name']} have been saved with suffix '{config['suffix']}'.")
+
+        except Exception as e:
+            print(f"\nError during optimization for {config['display_name']}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        print("="*50)
+
+    if len(all_metrics) == len(objective_configs) and len(all_metrics) > 0:
+        print("\nGenerating comparison plot for all objectives...")
+        plot_comparison_results(all_metrics, objective_names_for_plot)
+    else:
+        print("\nSkipping comparison plot due to errors in one or more optimization runs.")
+
     print("\n" + "="*50)
-    print("Optimization process completed.")
-    print("Results have been saved to:")
-    print("- vector.csv: Base rates for each day")
-    print("- discounts.csv: Discount factors for each day and length of stay")
-    print("- price_comparison.csv: Original vs Calculated prices")
-    print("- original_prices.png: Heatmap of the input matrix")
-    print("- base_rates.png: Plot of the derived base rates")
-    print("- discount_curves.png: Plot of the derived discount tiers")
-    print("- calculated_prices.png: Heatmap of the prices reconstructed from base rates and discounts")
-    print("- error_heatmap.png: Heatmap of the absolute differences between original and calculated prices")
+    print("Optimization process completed for all objectives.")
+    print("Check individual CSV and PNG files for detailed results for each objective,")
+    print("and 'error_metrics_comparison.png' for a summary.")
+    print("="*50)
 
 if __name__ == "__main__":
     main()
+
