@@ -140,5 +140,43 @@ py pricing_decomposition.py
 3. Additional validation and error handling
 4. Support for different optimization objectives
 
-### 7. Conclusion
+## 8. Targeting Specific Error Profiles
+
+A common requirement is to minimize percentage-based errors like Median Absolute Percentage Error (MedAPE) or Root Mean Squared Percentage Error (RMSPE), especially when wanting to penalize larger percentage deviations more significantly (e.g., with a quadratic or even an implicit exponential-like increase in penalty for larger errors).
+
+**Current Approach with MSPE Objective:**
+
+The `pricing_decomposition.py` script's **Mean Squared Percentage Error (MSPE)** objective function (`objective_type = 'MSPE'`) is specifically designed to address this.
+- By minimizing the *square* of the percentage errors (`((calculated - actual) / actual)^2`), it inherently gives a much higher weight to larger percentage deviations. This quadratic penalty often serves as a good proxy for an "exponential increase in error" for practical purposes, as it strongly discourages solutions with high percentage outliers.
+- Optimizing for MSPE generally leads to favorable RMSPE values and often good MedAPE values as well, as it directly targets the squared percentage discrepancies.
+
+**Why MSPE is Effective:**
+- **Focus on Relative Error:** It directly optimizes for percentage differences, making it suitable when the relative accuracy across different price magnitudes is important.
+- **Penalty for Large Deviations:** The squaring mechanism ensures that a 10% error contributes four times more to the objective than a 5% error, thus strongly penalizing larger relative mistakes.
+
+**Visualizing MSPE Performance:**
+
+The following images illustrate the typical performance when using the MSPE objective with the example `pricing_matrix_30x30.csv` (assuming images are in the same directory as `SOLUTION.md`):
+
+1.  **Error Metrics Comparison:** This plot shows how MSPE performs on MedAPE and RMSPE compared to other objectives like WMSE.
+    ![Error Metrics Comparison](error_metrics_comparison.png)
+
+2.  **Error Heatmap for MSPE:** This visualizes the distribution of absolute errors for the solution found using the MSPE objective.
+    ![Error Heatmap MSPE](error_heatmap_mspe.png)
+
+3.  **Calculated Prices for MSPE:** This shows the reconstructed pricing matrix from the MSPE optimization.
+    ![Calculated Prices MSPE](calculated_prices_mspe.png)
+
+**Achieving True Exponential Penalty:**
+
+If a *true* exponential penalty (e.g., `exp(abs_percentage_error) - 1`) is strictly required, the `objective_function` within `pricing_decomposition.py` would need to be modified. This would involve:
+1.  Calculating the percentage error.
+2.  Applying the exponential function to this error.
+3.  Summing these transformed errors.
+
+However, such modifications can make the optimization landscape significantly more complex and potentially less stable for standard solvers like SLSQP. The MSPE objective usually provides a good balance of strong penalization for large percentage errors and solvability.
+
+---
+
+### 9. Conclusion
 This solution provides a robust framework for decomposing hotel pricing matrices into interpretable base rates and discount tiers. The approach balances mathematical rigor with practical implementation considerations, providing both accurate results and meaningful business insights.

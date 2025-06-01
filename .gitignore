@@ -32,13 +32,18 @@ ENV/
 *.swo
 
 # Output files from pricing_decomposition.py
-*.png
+*.png # Ignore all PNGs by default
 vector_*.csv
 discounts_*.csv
 price_comparison_*.csv
 
 # Keep the example input data file if present
 !pricing_matrix_30x30.csv
+
+# Un-ignore specific PNGs referenced in documentation
+!error_metrics_comparison.png
+!error_heatmap_mspe.png
+!calculated_prices_mspe.png
 
 # Local development
 .env
