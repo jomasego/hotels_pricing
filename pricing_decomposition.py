@@ -4,6 +4,100 @@ from scipy.optimize import minimize
 import pulp
 import matplotlib.pyplot as plt
 import seaborn as sns
+from typing import Tuple # Added for type hints, can be np.ndarray directly too
+
+def calculate_appe(
+    y_true: np.ndarray, 
+    y_pred: np.ndarray, 
+    k: float = 3.0, 
+    w_neg: float = 2.0, 
+    w_pos: float = 1.0
+) -> float:
+    """
+    Calculates the Asymmetric Powered Percentage Error (APPE).
+
+    This loss function is designed to heavily penalize large percentage errors,
+    with a more significant penalty for overpricing (predicted price > actual price)
+    compared to underpricing.
+
+    Parameters:
+    -----------
+    y_true : np.ndarray
+        An array of true target values (e.g., actual hotel prices).
+        All values in y_true are expected to be positive.
+    y_pred : np.ndarray
+        An array of predicted values from the model, corresponding to y_true.
+    k : float, optional
+        The exponent (power) to which the absolute percentage error is raised.
+        Default: 3.0.
+    w_neg : float, optional
+        The weight applied to negative percentage errors (instances of overpricing,
+        i.e., y_pred > y_true). Default: 2.0.
+    w_pos : float, optional
+        The weight applied to positive or zero percentage errors (instances of
+        underpricing or perfect prediction, i.e., y_pred <= y_true). Default: 1.0.
+
+    Return Value:
+    -------------
+    float
+        A single float value representing the mean APPE.
+
+    Assumptions:
+    ------------
+    - All elements in y_true must be positive for a meaningful percentage error
+      calculation in this pricing context.
+
+    Raises:
+    -------
+    TypeError
+        If y_true or y_pred are not NumPy arrays.
+    ValueError
+        If y_true and y_pred do not have the same shape.
+        If any element in y_true is not positive.
+
+    Example Usage:
+    --------------
+    >>> actual_prices = np.array([100, 150, 200, 250])
+    >>> predicted_prices = np.array([90, 160, 220, 240]) # 2 underprice, 2 overprice
+    >>> appe_loss = calculate_appe(actual_prices, predicted_prices, k=3, w_neg=2, w_pos=1)
+    >>> print(f"APPE Loss: {appe_loss}")
+    # Expected output will depend on precise calculation, but demonstrates usage.
+    # For the example:
+    # PE1 = (100-90)/100 = 0.1 (underprice) -> cost1 = 1.0 * (0.1^3) = 0.001
+    # PE2 = (150-160)/150 = -0.0666 (overprice) -> cost2 = 2.0 * (|-0.0666|^3) approx 2.0 * 0.000296 = 0.000592
+    # PE3 = (200-220)/200 = -0.1 (overprice) -> cost3 = 2.0 * (|-0.1|^3) = 2.0 * 0.001 = 0.002
+    # PE4 = (250-240)/250 = 0.04 (underprice) -> cost4 = 1.0 * (0.04^3) = 0.000064
+    # Mean APPE = (0.001 + 0.000592 + 0.002 + 0.000064) / 4 = 0.003656 / 4 = 0.000914
+    """
+    if not isinstance(y_true, np.ndarray) or not isinstance(y_pred, np.ndarray):
+        raise TypeError("y_true and y_pred must be NumPy arrays.")
+
+    if y_true.shape != y_pred.shape:
+        raise ValueError("y_true and y_pred must have the same shape.")
+
+    if not np.all(y_true > 0):
+        raise ValueError("All elements in y_true must be positive for APPE calculation.")
+
+    # Calculate Percentage Error (PE)
+    # PE_i = (y_true_i - y_pred_i) / y_true_i
+    # If PE_i < 0, it means y_pred_i > y_true_i (overpricing)
+    # If PE_i > 0, it means y_pred_i < y_true_i (underpricing)
+    percentage_errors = (y_true - y_pred) / y_true
+    
+    abs_percentage_errors_powered = np.abs(percentage_errors)**k
+    
+    # Apply weights:
+    # Create a weights array based on the sign of percentage_errors
+    # Where PE < 0 (overpricing), use w_neg
+    # Where PE >= 0 (underpricing/perfect), use w_pos
+    weights = np.where(percentage_errors < 0, w_neg, w_pos)
+    
+    costs = weights * abs_percentage_errors_powered
+    
+    mean_appe = np.mean(costs)
+    
+    return mean_appe
+
 
 class PricingMatrixDecomposer:
     def __init__(self, matrix_file):
@@ -19,6 +113,8 @@ class PricingMatrixDecomposer:
         self.n_cutoffs = len(self.cutoffs)
         self.active_objective_type = None # To be set by solve method
         self.objective_filename_suffix = "" # To be set by solve method
+        self.appe_params = None # For APPE specific parameters
+        self.active_objective_config = None # To store the full config
         
     def _load_matrix(self, file_path):
         """
@@ -82,11 +178,16 @@ class PricingMatrixDecomposer:
         Compute the objective function value for the current solution vector.
         Conditionally calculates error based on self.active_objective_type.
         """
+        if np.any(np.isnan(x)) or np.any(np.isinf(x)):
+            print(f"DEBUG ({self.active_objective_type}): Input x contains NaN/Inf. Returning 1e15.")
+            return 1e15 # Penalty for invalid input x
+
         try:
             base_rates = x[:self.n_days]
             discounts = x[self.n_days:].reshape((self.n_days, self.n_cutoffs))
 
             if np.any(base_rates <= 0):
+                print(f"DEBUG ({self.active_objective_type}): base_rates <= 0. Returning 1e15.")
                 return 1e15
             discounts = np.clip(discounts, 0.01, 0.99)
             calculated_matrix = self.calculate_prices(base_rates, discounts)
@@ -94,34 +195,53 @@ class PricingMatrixDecomposer:
             valid_mask = ~np.isnan(self.matrix)
 
             if np.sum(valid_mask) == 0:
+                print(f"DEBUG ({self.active_objective_type}): No valid entries in mask. Returning 1e15.")
                 return 1e15
-            if np.any(np.isnan(calculated_matrix[valid_mask])):
+            if np.any(np.isnan(calculated_matrix[valid_mask])) or np.any(np.isinf(calculated_matrix[valid_mask])):
+                print(f"DEBUG ({self.active_objective_type}): calculated_matrix contains NaN/Inf. Returning 1e15.")
                 return 1e15
 
             core_error = 0
-            # Penalty coefficients will be set based on objective type
-            penalty_non_monotonic_coeff = 0.0
-            regularization_coeff = 0.0
-            boundary_penalty_coeff = 0.0
-
             if self.active_objective_type == 'MSPE':
                 original_prices_for_pe = np.maximum(self.matrix[valid_mask], 1.0)
                 percentage_error = error_values[valid_mask] / original_prices_for_pe
                 core_error = np.mean(percentage_error ** 2) # MSPE
-                
-                penalty_non_monotonic_coeff = 100.0
-                regularization_coeff = 1e-8
-                boundary_penalty_coeff = 1.0 
 
             elif self.active_objective_type == 'WMSE':
                 weights = 1.0 / (np.maximum(self.matrix[valid_mask], 1.0) ** 0.5)
                 core_error = np.sum(weights * (error_values[valid_mask]) ** 2) / np.sum(valid_mask) # Weighted MSE
 
-                penalty_non_monotonic_coeff = 1e6
-                regularization_coeff = 1e-4 
-                boundary_penalty_coeff = 1e4
+            elif self.active_objective_type == 'APPE':
+                if self.appe_params:
+                    core_error = calculate_appe(
+                        self.matrix[valid_mask],
+                        calculated_matrix[valid_mask],
+                        k=self.appe_params.get('k', 3.0),
+                        w_neg=self.appe_params.get('w_neg', 2.0),
+                        w_pos=self.appe_params.get('w_pos', 1.0)
+                    )
+                else: # Fallback to defaults
+                    core_error = calculate_appe(
+                        self.matrix[valid_mask],
+                        calculated_matrix[valid_mask]
+                    )
             else:
                 raise ValueError(f"Unknown objective type: {self.active_objective_type}")
+
+            # Default penalty coefficients
+            default_penalty_coeffs = {
+                'non_monotonic': 100.0,
+                'regularization': 1e-8, # A small default, can be overridden
+                'boundary': 1000.0      # A moderate default, can be overridden
+            }
+
+            # Get objective-specific penalty coefficients, or use defaults from active_objective_config
+            # If 'penalty_coeffs' is not in active_objective_config, or a specific key is missing from it, use the default_penalty_coeffs value.
+            config_penalty_coeffs = self.active_objective_config.get('penalty_coeffs', {})
+            
+            penalty_non_monotonic_coeff = config_penalty_coeffs.get('non_monotonic', default_penalty_coeffs['non_monotonic'])
+            regularization_coeff = config_penalty_coeffs.get('regularization', default_penalty_coeffs['regularization'])
+            boundary_penalty_coeff = config_penalty_coeffs.get('boundary', default_penalty_coeffs['boundary'])
 
             # Shared penalty calculations
             monotonicity_penalty_val = 0.0
@@ -152,13 +272,14 @@ class PricingMatrixDecomposer:
             
             result = core_error + total_penalty
 
-            if np.isnan(result) or np.isinf(result):
+            if np.isnan(result) or np.isinf(result) or result > 1e14:  # Cap very large finite values
+                print(f"DEBUG ({self.active_objective_type}): Final result is NaN/Inf or >1e14 ({result=}). Returning 1e15.")
                 return 1e15
             return result
 
         except Exception as e:
-            print(f"Error in objective function ({self.active_objective_type}): {str(e)}")
-            return 1e15
+            print(f"DEBUG ({self.active_objective_type}): Exception caught: {str(e)}. Returning 1e16.")
+            return 1e16 # Distinct penalty for unexpected exceptions
     
     def solve(self, objective_config, method='SLSQP', max_iter=1000):
         """
@@ -166,9 +287,14 @@ class PricingMatrixDecomposer:
         Uses objective_config to determine error metric and output naming.
         objective_config = {'type': 'MSPE'/'WMSE', 'suffix': '_suffix', 'display_name': 'Display Name'}
         """
-        self.active_objective_type = objective_config['type']
-        self.objective_filename_suffix = objective_config['suffix']
-        objective_display_name = objective_config['display_name']
+        self.active_objective_config = objective_config # Store the whole config
+        self.active_objective_type = self.active_objective_config['type']
+        self.objective_filename_suffix = self.active_objective_config['suffix']
+        objective_display_name = self.active_objective_config['display_name']
+        if self.active_objective_type == 'APPE':
+            self.appe_params = self.active_objective_config.get('appe_params', {'k': 3.0, 'w_neg': 2.0, 'w_pos': 1.0})
+        else:
+            self.appe_params = None # Clear if not APPE
 
         print(f"\n--- Starting Optimization for: {objective_display_name} ({self.active_objective_type}) ---")
         print(f"Primary method: {method} (max {max_iter} iterations)...")
@@ -237,11 +363,18 @@ class PricingMatrixDecomposer:
                 calc = self.calculate_prices(br, disc)
                 errs = calc - self.matrix
                 valid_m = ~np.isnan(self.matrix)
+
+                if np.sum(valid_m) == 0:
+                    print(f"DEBUG ({self.active_objective_type}): No valid entries in mask. Returning 1e15.")
+                    return 1e15
+                if np.any(np.isnan(calc[valid_m])) or np.any(np.isinf(calc[valid_m])):
+                    print(f"DEBUG ({self.active_objective_type}): calculated_matrix contains NaN/Inf. Returning 1e15.")
+                    return 1e15
+
                 if self.active_objective_type == 'MSPE':
-                    # Calculate RMSPE for evaluation
                     original_prices_for_pe = np.maximum(self.matrix[valid_m], 1.0)
-                    percentage_errors = errs[valid_m] / original_prices_for_pe
-                    mspe_eval = np.mean(percentage_errors ** 2)
+                    percentage_error = errs[valid_m] / original_prices_for_pe
+                    mspe_eval = np.mean(percentage_error ** 2) # MSPE
                     rmspe_eval = np.sqrt(mspe_eval) * 100  # As a percentage
                     return rmspe_eval
                 elif self.active_objective_type == 'WMSE':
@@ -250,8 +383,24 @@ class PricingMatrixDecomposer:
                     current_mae = np.mean(abs_errs)
                     current_mape = np.mean(rel_errs) * 100
                     return current_mae + current_mape / 10 # Original WMSE evaluation metric
+                elif self.active_objective_type == 'APPE':
+                    if self.appe_params:
+                        appe_eval = calculate_appe(
+                            self.matrix[valid_m],
+                            calc[valid_m],
+                            k=self.appe_params.get('k', 3.0),
+                            w_neg=self.appe_params.get('w_neg', 2.0),
+                            w_pos=self.appe_params.get('w_pos', 1.0)
+                        )
+                    else:
+                        appe_eval = calculate_appe(
+                            self.matrix[valid_m],
+                            calc[valid_m]
+                        )
+                    return appe_eval
                 else:
                     return float('inf')
+
             except Exception as eval_e:
                 print(f"Error evaluating solution: {eval_e}")
                 return float('inf')
@@ -542,18 +691,38 @@ def main():
         {
             'type': 'WMSE',
             'suffix': '_wmse',
-            'display_name': 'Weighted MSE'
+            'display_name': 'Weighted Mean Squared Error (WMSE)',
+            'penalty_coeffs': {
+                'non_monotonic': 1e6,
+                'regularization': 1e-4,
+                'boundary': 1e4
+            }
         },
         {
             'type': 'MSPE',
             'suffix': '_mspe',
-            'display_name': 'Mean Squared Percentage Error'
+            'display_name': 'Mean Squared Percentage Error (MSPE)',
+            'penalty_coeffs': {
+                'non_monotonic': 100.0,
+                'regularization': 1e-8,
+                'boundary': 1.0
+            }
+        },
+        {
+            'type': 'APPE',
+            'suffix': '_appe',
+            'display_name': 'Asymmetric Powered Percentage Error (APPE k=3, w_neg=2)',
+            'appe_params': {'k': 3.0, 'w_neg': 2.0, 'w_pos': 1.0},
+            'penalty_coeffs': {
+                'non_monotonic': 100.0,
+                'regularization': 1e-8,
+                'boundary': 100.0
+            }
         }
     ]
 
     all_metrics = []
     objective_names_for_plot = []
-
     for config in objective_configs:
         print(f"\nStarting optimization for {config['display_name']} (this may take a few minutes)...")
         try:
@@ -601,4 +770,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

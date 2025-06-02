@@ -15,10 +15,29 @@ We are given a 30×30 upper-triangular matrix representing stay prices where:
 - **Discounts (dᵢⱼ)**: Discount percentage for day i and cut-off j (8 cut-offs: 2,3,4,5,6,7,14,28 nights)
 
 #### Objective Function:
-Minimize the sum of squared differences between calculated and target prices:
+The system supports three distinct objective functions for optimization:
+
+1. **Weighted Mean Squared Error (WMSE)**:
 ```
-minimize Σ(calculated_price(i,j) - target_price(i,j))²
+minimize Σ(w_ij * (calculated_price(i,j) - target_price(i,j))²)
+where w_ij = 1 / sqrt(target_price(i,j))
 ```
+
+2. **Mean Squared Percentage Error (MSPE)**:
+```
+minimize Σ((calculated_price(i,j) - target_price(i,j)) / target_price(i,j))²
+```
+
+3. **Asymmetric Powered Percentage Error (APPE)**:
+```
+minimize Σ(w_neg/pos * |error_percentage(i,j)|^k)
+where w_neg = 2.0 for overpricing, w_pos = 1.0 for underpricing, k = 3.0
+```
+
+Each objective includes penalty terms for constraint violations:
+- Non-monotonic penalty: Enforces increasing discounts with length of stay
+- Regularization penalty: Prevents overfitting 
+- Boundary penalty: Keeps variables within valid bounds
 
 #### Constraints:
 1. Base rates > 0
@@ -51,6 +70,18 @@ minimize Σ(calculated_price(i,j) - target_price(i,j))²
    - Graceful degradation with meaningful error messages and detailed logging.
    - Input validation and data integrity checks during matrix loading.
 
+4. **Configurable Penalty Coefficients** 🔧:
+   - Non-monotonic, regularization, and boundary penalty coefficients are configurable per objective
+   - WMSE uses high penalties (1e6, 1e-4, 1e4) for strict constraint enforcement
+   - MSPE uses moderate penalties (100.0, 1e-8, 1.0) for balanced optimization
+   - APPE uses conservative penalties (100.0, 1e-8, 100.0) for stable convergence
+
+5. **Recent Improvements** 🚀:
+   - **Fixed APPE evaluation**: Resolved infinite error metrics by implementing proper APPE error calculation in `evaluate_solution`
+   - **Enhanced robustness**: Added input validation to detect NaN/infinite values before optimization
+   - **Improved diagnostics**: Added detailed logging throughout the optimization pipeline for debugging
+   - **Stabilized convergence**: Reduced boundary penalties for APPE to achieve consistent results
+
 ### 3. Implementation Details
 
 #### Data Flow:
@@ -60,14 +91,15 @@ minimize Σ(calculated_price(i,j) - target_price(i,j))²
    - Run optimization with constraints
    - Post-process results to ensure validity
 3. **Output** 📊:
-   - `vector.csv`: Calculated base rates for each day.
-   - `discounts.csv`: Calculated discount percentages for each day and cut-off tier.
-   - `price_comparison.csv`: Original prices vs. calculated prices for each valid stay.
-   - `original_prices.png`: Heatmap of the input pricing matrix.
-   - `base_rates.png`: Plot of the derived base rates over the 30 days.
-   - `discount_curves.png`: Plot of the derived discount tiers for each day.
-   - `calculated_prices.png`: Heatmap of the reconstructed price matrix using the derived base rates and discounts.
-   - `error_heatmap.png`: Heatmap of the absolute differences between original and calculated prices.
+   - `vector{suffix}.csv`: Calculated base rates for each day (suffix: _wmse, _mspe, _appe).
+   - `discounts{suffix}.csv`: Calculated discount percentages for each day and cut-off tier.
+   - `price_comparison{suffix}.csv`: Original prices vs. calculated prices for each valid stay.
+   - `original_prices.png`: Heatmap of the input pricing matrix (generated once).
+   - `base_rates{suffix}.png`: Plot of the derived base rates over the 30 days.
+   - `discount_curves{suffix}.png`: Plot of the derived discount tiers for each day.
+   - `calculated_prices{suffix}.png`: Heatmap of the reconstructed price matrix using the derived base rates and discounts.
+   - `error_heatmap{suffix}.png`: Heatmap of the absolute differences between original and calculated prices.
+   - `error_metrics_comparison.png`: Comparative analysis of all three objectives.
    - Console output with optimization progress, final metrics, and status messages.
 
 #### Key Functions:
@@ -79,33 +111,30 @@ minimize Σ(calculated_price(i,j) - target_price(i,j))²
 
 ### 4. Results and Validation
 
-#### Output Files:
-1. **vector.csv**
-   ```
-   Day,Base_Rate
-   1,123.456789
-   2,124.567890
-   ...
-   30,120.987654
-   ```
+#### Performance Comparison Table
+The following table summarizes the performance of all three optimization objectives:
 
-2. **discounts.csv**
-   ```
-   Day,Cutoff_2,Cutoff_3,Cutoff_4,Cutoff_5,Cutoff_6,Cutoff_7,Cutoff_14,Cutoff_28
-   1,0.050000,0.100000,0.150000,0.200000,0.250000,0.300000,0.350000,0.400000
-   ...
-   30,0.052000,0.102000,0.152000,0.202000,0.252000,0.302000,0.352000,0.402000
-   ```
+| Metric | Weighted MSE (WMSE) | Mean Squared Percentage Error (MSPE) | Asymmetric Powered Percentage Error (APPE) |
+|--------|---------------------|----------------------------------------|---------------------------------------------|
+| MAE (Mean Absolute Error) | $41.09 | $33.04 | $68.98 |
+| MSE (Mean Squared Error) | 5766.31 | 9098.36 | 15187.84 |
+| MAPE (Mean Abs. % Error) | 6.17% | 3.29% | 7.96% |
+| MedAPE (Median Abs. % Error) | 5.15% | 2.44% | 6.57% |
+| RMSPE (Root Mean Sq. % Err.) | 8.41% | 5.58% | 10.25% |
+| Max Absolute Error | $593.58 | $852.36 | $852.06 |
+| Convergence (Iterations) | 165 | 97 | 18 |
 
-#### Performance Metrics (Example from a successful SLSQP run):
-- Mean Absolute Error (MAE): $69.67
-- Mean Squared Error (MSE): 25973.70
-- Mean Absolute Percentage Error (MAPE): 7.24%
-- Median Absolute Percentage Error (MedAPE): 5.55%
-- Maximum Absolute Error: $1349.75
-- Optimization Status: Succeeded (SLSQP)
-- Iterations: 41
-- Function Evaluations: 11261
+#### Key Observations:
+- **MSPE achieves the best percentage-based accuracy** with lowest MAPE (3.29%) and RMSPE (5.58%)
+- **WMSE provides the best absolute accuracy** with lowest MAE ($41.09) and manageable percentage errors
+- **APPE converges fastest** (18 iterations) and successfully avoids infinite error metrics
+- **APPE's higher absolute errors** reflect its asymmetric penalty structure, emphasizing overpricing avoidance over absolute accuracy
+
+#### Optimization Success:
+All three methods converged successfully with SLSQP as the primary optimizer:
+- **WMSE**: 165 iterations, 44,592 function evaluations
+- **MSPE**: 97 iterations, 26,299 function evaluations  
+- **APPE**: 18 iterations, 4,887 function evaluations (fastest convergence)
 
 ### 5. Usage
 
