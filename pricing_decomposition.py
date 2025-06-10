@@ -100,16 +100,46 @@ def calculate_appe(
 
 
 class PricingMatrixDecomposer:
-    def __init__(self, matrix_file):
+    def __init__(self, matrix_input):
         """
-        Initialize the pricing matrix decomposer with the input matrix file.
+        Initialize the pricing matrix decomposer with the input matrix.
         
         Args:
-            matrix_file (str): Path to the CSV file containing the pricing matrix
+            matrix_input (str, np.ndarray, pd.DataFrame): 
+                Path to the CSV file containing the pricing matrix,
+                or a pre-loaded NumPy array, or a Pandas DataFrame.
         """
-        self.matrix = self._load_matrix(matrix_file)
+        if isinstance(matrix_input, str):
+            self.matrix = self._load_matrix(matrix_input)
+        elif isinstance(matrix_input, np.ndarray):
+            self.matrix = matrix_input.astype(float) # Ensure float type
+        elif isinstance(matrix_input, pd.DataFrame):
+            self.matrix = matrix_input.values.astype(float) # Ensure float type
+        else:
+            raise TypeError(
+                "matrix_input must be a file path (str), NumPy array, or Pandas DataFrame. "
+                f"Got {type(matrix_input)}"
+            )
+        
+        if self.matrix.ndim != 2:
+            raise ValueError(
+                f"Input matrix must be 2-dimensional. Received shape: {self.matrix.shape}"
+            )
+        
         self.n_days = self.matrix.shape[0]
-        self.cutoffs = np.array([2, 3, 4, 5, 6, 7, 14, 28])
+        if self.n_days == 0:
+            raise ValueError(
+                "Input matrix must not be empty (0 rows/n_days). Received shape: "
+                f"{self.matrix.shape}"
+            )
+        
+        if self.matrix.shape[1] == 0:
+             raise ValueError(
+                "Input matrix must have at least one column (max_los > 0). Received shape: "
+                f"{self.matrix.shape}"
+            )
+
+        self.cutoffs = np.array([2, 3, 4, 5, 6, 7, 14, 28]) # LOS cutoffs for discount tiers
         self.n_cutoffs = len(self.cutoffs)
         self.active_objective_type = None # To be set by solve method
         self.objective_filename_suffix = "" # To be set by solve method
@@ -508,9 +538,11 @@ class PricingMatrixDecomposer:
 
         try:
             print(f"\nSaving results for {objective_display_name} to CSV files...")
-            pd.DataFrame(final_base_rates, columns=['Base_Rate'], index=[f'Day {i+1}' for i in range(self.n_days)]).to_csv(f'vector{self.objective_filename_suffix}.csv')
-            pd.DataFrame(final_discounts, columns=[f'Cutoff_{c}' for c in self.cutoffs], index=[f'Day {i+1}' for i in range(self.n_days)]).to_csv(f'discounts{self.objective_filename_suffix}.csv')
+            # CSV saving for base rates and discounts can be handled by the caller if needed.
+            # pd.DataFrame(final_base_rates, columns=['Base_Rate'], index=[f'Day {i+1}' for i in range(self.n_days)]).to_csv(f'vector{self.objective_filename_suffix}.csv')
+            # pd.DataFrame(final_discounts, columns=[f'Cutoff_{c}' for c in self.cutoffs], index=[f'Day {i+1}' for i in range(self.n_days)]).to_csv(f'discounts{self.objective_filename_suffix}.csv')
             
+            # Keep comparison data CSV for debugging if desired, or remove if not needed by the caller
             comparison_data = []
             for r_idx in range(self.n_days):
                 for c_idx in range(self.n_days):
@@ -523,32 +555,16 @@ class PricingMatrixDecomposer:
                             'AbsoluteError': abs(final_errors[r_idx, c_idx])
                         })
             pd.DataFrame(comparison_data).to_csv(f'price_comparison{self.objective_filename_suffix}.csv', index=False)
-            print(f"Base rates saved to vector{self.objective_filename_suffix}.csv")
-            print(f"Discount tiers saved to discounts{self.objective_filename_suffix}.csv")
             print(f"Price comparison saved to price_comparison{self.objective_filename_suffix}.csv")
 
             self.plot_results(final_base_rates, final_discounts, final_calculated_prices, filename_suffix=self.objective_filename_suffix)
 
-        except Exception as save_e:
-            print(f"Error saving results or plotting for {objective_display_name}: {save_e}")
-
-        error_metrics = {
-            'mae': final_mae,
-            'mse': final_mse,
-            'mape': final_mape,
-            'median_ape': final_median_ape,
-            'max_error': final_max_error,
-            'rmspe': final_rmspe
-        }
-
-        return {
-            'success': best_result_obj.success,
-            'message': getattr(best_result_obj, 'message', 'N/A'),
-            'base_rates': final_base_rates,
-            'discounts': final_discounts,
-            'calculated': final_calculated_prices,
-            'error_metrics': error_metrics
-        }
+            # The caller can calculate error_metrics if needed using the returned base_rates and discounts.
+            return final_base_rates, final_discounts
+        except Exception as e:
+            print(f"Error during optimization or result processing in solve method: {e}")
+            # Potentially log the error more formally here
+            raise # Re-raise the caught exception
 
     def plot_results(self, base_rates, discounts, calculated, filename_suffix=""):
         """
